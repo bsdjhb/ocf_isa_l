@@ -145,6 +145,7 @@ isal_probesession(device_t dev, const struct crypto_session_params *csp)
 		default:
 			return (EINVAL);
 		}
+		break;
 	default:
 		return (EINVAL);
 	}
@@ -207,7 +208,7 @@ isal_process(device_t dev, struct cryptop *crp, int hint)
 	bool aad_allocated;
 
 	aad_allocated = false;
-	if ((crp->crp_flags & CRYPTO_F_IV_SEPARATE) != 0) {
+	if ((crp->crp_flags & CRYPTO_F_IV_SEPARATE) == 0) {
 		error = EINVAL;
 		goto out;
 	}
