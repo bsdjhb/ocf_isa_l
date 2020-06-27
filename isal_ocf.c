@@ -132,8 +132,6 @@ isal_probesession(device_t dev, const struct crypto_session_params *csp)
 		switch (csp->csp_cipher_alg) {
 		case CRYPTO_AES_NIST_GCM_16:
 			if (csp->csp_auth_mlen != 0 &&
-			    csp->csp_auth_mlen != 8 &&
-			    csp->csp_auth_mlen != 12 &&
 			    csp->csp_auth_mlen != 16)
 				return (EINVAL);
 			if (csp->csp_ivlen != 12)
@@ -203,6 +201,7 @@ isal_process(device_t dev, struct cryptop *crp, int hint)
 	    struct gcm_context_data *, uint8_t *, const uint8_t *, uint64_t);
 	void (*aes_gcm_update_nt)(const struct gcm_key_data *,
 	    struct gcm_context_data *, uint8_t *, const uint8_t *, uint64_t);
+	uint8_t tag[16];
 	size_t inlen, outlen, resid, todo;
 	int error;
 	bool aad_allocated;
@@ -334,12 +333,29 @@ isal_process(device_t dev, struct cryptop *crp, int hint)
 			resid -= todo;
 		}
 	}
-	
-	fpu_kern_leave(curthread, NULL);
 
 	error = 0;
-out:
+
+	if (CRYPTO_OP_IS_ENCRYPT(crp->crp_op)) {
+		s->aes_gcm_enc_finalize(&s->key_data, &context_data, tag,
+		    sizeof(tag));
+		crypto_copyback(crp, crp->crp_digest_start, sizeof(tag), tag);
+	} else {
+		uint8_t tag2[16];
+
+		s->aes_gcm_dec_finalize(&s->key_data, &context_data, tag,
+		    sizeof(tag));
+		crypto_copydata(crp, crp->crp_digest_start, sizeof(tag), tag2);
+		if (timingsafe_bcmp(tag2, tag, 16) != 0)
+			error = EBADMSG;
+	}
+
+	fpu_kern_leave(curthread, NULL);
+
+	explicit_bzero(&tag, sizeof(tag));
 	explicit_bzero(&context_data, sizeof(context_data));
+
+out:
 	if (aad_allocated)
 		free(aad, M_ISAL);
 	crp->crp_etype = error;
