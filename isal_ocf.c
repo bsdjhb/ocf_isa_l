@@ -149,7 +149,7 @@ isal_probesession(device_t dev, const struct crypto_session_params *csp)
 	}
 
 	/* Prefer to aesni(4). */
-	return (CRYPTODEV_PROBE_ACCEL_SOFTWARE - 10);
+	return (CRYPTODEV_PROBE_ACCEL_SOFTWARE + 10);
 }
 
 static int
