@@ -1,0 +1,63 @@
+.\" Copyright (c) 2020 Netflix, Inc
+.\"
+.\" Redistribution and use in source and binary forms, with or without
+.\" modification, are permitted provided that the following conditions
+.\" are met:
+.\" 1. Redistributions of source code must retain the above copyright
+.\"    notice, this list of conditions and the following disclaimer,
+.\"    without modification.
+.\" 2. Redistributions in binary form must reproduce at minimum a disclaimer
+.\"    similar to the "NO WARRANTY" disclaimer below ("Disclaimer") and any
+.\"    redistribution must be conditioned upon including a substantially
+.\"    similar Disclaimer requirement for further binary redistribution.
+.\"
+.\" NO WARRANTY
+.\" THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+.\" ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+.\" LIMITED TO, THE IMPLIED WARRANTIES OF NONINFRINGEMENT, MERCHANTIBILITY
+.\" AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL
+.\" THE COPYRIGHT HOLDERS OR CONTRIBUTORS BE LIABLE FOR SPECIAL, EXEMPLARY,
+.\" OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+.\" SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+.\" INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER
+.\" IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+.\" ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
+.\" THE POSSIBILITY OF SUCH DAMAGES.
+.\"
+.Dd June 29, 2020
+.Dt ISAL 4
+.Os
+.Sh NAME
+.Nm isal
+.Nd "driver for AES acceleration on x86 CPUs"
+.Sh SYNOPSIS
+To load the driver as a module at boot time, place the following line in
+.Xr loader.conf 5 :
+.Bd -literal -offset indent
+aesni_load="YES"
+.Ed
+.Sh DESCRIPTION
+This driver provides an interface between the Intel Intelligent Storage
+Acceleration Crypto Library and the kernel opencrypto framework.
+The library provides optimized routines that implement encryption and
+decryption for various modes of the AES cipher and computations of
+secure hashes.
+These optimized routines use the AESNI instructions as well as various
+vector instruction extensions including SSE4.1, AVX, and AVX2.
+.Pp
+This driver currently supports the following algorithms:
+.Bl -column "AES-GCM-128"
+.It Sy Algorithm Ta Sy Required CPU Extensions
+.It AES-GCM-128 Ta AESNI and SSE4.1
+.It AES-GCM-256 Ta AESNI and SSE4.1
+.Pp
+.Nm
+provides support for fewer algorithms than
+.Xr aesni 4 .
+However, it will provide improved performance for supported algorithms
+compared to
+.Xr aesni 4 .
+.Sh SEE ALSO
+.Xr aesni 4 ,
+.Xr crypto 4 ,
+.Xr intro 4
