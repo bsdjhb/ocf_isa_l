@@ -28,9 +28,11 @@
 
 #include <sys/types.h>
 #include <sys/bus.h>
+#include <sys/counter.h>
 #include <sys/kernel.h>
 #include <sys/malloc.h>
 #include <sys/module.h>
+#include <sys/sysctl.h>
 #include <machine/fpu.h>
 #include <machine/md_var.h>
 #include <machine/specialreg.h>
@@ -43,6 +45,13 @@
 
 struct isal_softc {
 	int32_t	sc_cid;
+
+	counter_u64_t sc_gcm_encrypt;
+	counter_u64_t sc_gcm_decrypt;
+	counter_u64_t sc_gcm_update_bytes;
+	counter_u64_t sc_gcm_update_nt_bytes;
+	counter_u64_t sc_gcm_update_calls;
+	counter_u64_t sc_gcm_update_nt_calls;
 };
 
 struct isal_session {
@@ -91,6 +100,42 @@ isal_probe(device_t dev)
 	return (BUS_PROBE_DEFAULT);
 }
 
+static void
+isal_sysctls(device_t dev, struct isal_softc *sc)
+{
+	struct sysctl_ctx_list *ctx;
+	struct sysctl_oid *oid;
+	struct sysctl_oid_list *children;
+
+	ctx = device_get_sysctl_ctx(dev);
+
+	oid = device_get_sysctl_tree(dev);
+	children = SYSCTL_CHILDREN(oid);
+
+	oid = SYSCTL_ADD_NODE(ctx, children, OID_AUTO, "stats",
+	    CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, "statistics");
+	children = SYSCTL_CHILDREN(oid);
+
+	SYSCTL_ADD_COUNTER_U64(ctx, children, OID_AUTO, "gcm_encrypt",
+	    CTLFLAG_RD, &sc->sc_gcm_encrypt,
+	    "AES-GCM encryption requests completed");
+	SYSCTL_ADD_COUNTER_U64(ctx, children, OID_AUTO, "gcm_decrypt",
+	    CTLFLAG_RD, &sc->sc_gcm_decrypt,
+	    "AES-GCM decryption requests completed");
+	SYSCTL_ADD_COUNTER_U64(ctx, children, OID_AUTO, "gcm_update_bytes",
+	    CTLFLAG_RD, &sc->sc_gcm_update_bytes,
+	    "Bytes encrypted/decrypted by regular update");
+	SYSCTL_ADD_COUNTER_U64(ctx, children, OID_AUTO, "gcm_update_nt_bytes",
+	    CTLFLAG_RD, &sc->sc_gcm_update_nt_bytes,
+	    "Bytes encrypted/decrypted by non-temporal update");
+	SYSCTL_ADD_COUNTER_U64(ctx, children, OID_AUTO, "gcm_update_calls",
+	    CTLFLAG_RD, &sc->sc_gcm_update_calls,
+	    "Calls to regular update functions");
+	SYSCTL_ADD_COUNTER_U64(ctx, children, OID_AUTO, "gcm_update_nt_calls",
+	    CTLFLAG_RD, &sc->sc_gcm_update_nt_calls,
+	    "Calls to non-temporal update functions");
+}
+
 static int
 isal_attach(device_t dev)
 {
@@ -106,6 +151,14 @@ isal_attach(device_t dev)
 		return (ENXIO);
 	}
 
+	sc->sc_gcm_encrypt = counter_u64_alloc(M_WAITOK);
+	sc->sc_gcm_decrypt = counter_u64_alloc(M_WAITOK);
+	sc->sc_gcm_update_bytes = counter_u64_alloc(M_WAITOK);
+	sc->sc_gcm_update_nt_bytes = counter_u64_alloc(M_WAITOK);
+	sc->sc_gcm_update_calls = counter_u64_alloc(M_WAITOK);
+	sc->sc_gcm_update_nt_calls = counter_u64_alloc(M_WAITOK);
+
+	isal_sysctls(dev, sc);
 	return (0);
 }
 
@@ -117,6 +170,13 @@ isal_detach(device_t dev)
 	sc = device_get_softc(dev);
 
 	crypto_unregister_all(sc->sc_cid);
+
+	counter_u64_free(sc->sc_gcm_encrypt);
+	counter_u64_free(sc->sc_gcm_decrypt);
+	counter_u64_free(sc->sc_gcm_update_bytes);
+	counter_u64_free(sc->sc_gcm_update_nt_bytes);
+	counter_u64_free(sc->sc_gcm_update_calls);
+	counter_u64_free(sc->sc_gcm_update_nt_calls);
 	return (0);
 }
 
@@ -194,6 +254,7 @@ isal_process(device_t dev, struct cryptop *crp, int hint)
 {
 	struct gcm_context_data context_data;
 	struct crypto_buffer_cursor cc_in, cc_out;
+	struct isal_softc *sc;
 	struct isal_session *s;
 	void *aad;
 	uint8_t *in, *out;
@@ -232,6 +293,7 @@ isal_process(device_t dev, struct cryptop *crp, int hint)
 		}
 	}
 
+	sc = device_get_softc(dev);
 	s = crypto_get_driver_session(crp->crp_session);
 
 	fpu_kern_enter(curthread, NULL, FPU_KERN_NOCTX);
@@ -291,6 +353,8 @@ isal_process(device_t dev, struct cryptop *crp, int hint)
 				out += todo;
 
 			resid -= todo;
+			counter_u64_add(sc->sc_gcm_update_nt_bytes, todo);
+			counter_u64_add(sc->sc_gcm_update_nt_calls, 1);
 		}
 
 		/*
@@ -320,6 +384,8 @@ isal_process(device_t dev, struct cryptop *crp, int hint)
 				out += todo;
 
 			resid -= todo;
+			counter_u64_add(sc->sc_gcm_update_bytes, todo);
+			counter_u64_add(sc->sc_gcm_update_calls, 1);
 		}
 	} else {
 		while (resid > 0) {
@@ -331,6 +397,8 @@ isal_process(device_t dev, struct cryptop *crp, int hint)
 			    todo);
 			crypto_cursor_advance(&cc_in, todo);
 			resid -= todo;
+			counter_u64_add(sc->sc_gcm_update_bytes, todo);
+			counter_u64_add(sc->sc_gcm_update_calls, 1);
 		}
 	}
 
@@ -340,6 +408,7 @@ isal_process(device_t dev, struct cryptop *crp, int hint)
 		s->aes_gcm_enc_finalize(&s->key_data, &context_data, tag,
 		    sizeof(tag));
 		crypto_copyback(crp, crp->crp_digest_start, sizeof(tag), tag);
+		counter_u64_add(sc->sc_gcm_encrypt, 1);
 	} else {
 		uint8_t tag2[16];
 
@@ -348,6 +417,7 @@ isal_process(device_t dev, struct cryptop *crp, int hint)
 		crypto_copydata(crp, crp->crp_digest_start, sizeof(tag), tag2);
 		if (timingsafe_bcmp(tag2, tag, 16) != 0)
 			error = EBADMSG;
+		counter_u64_add(sc->sc_gcm_decrypt, 1);
 	}
 
 	fpu_kern_leave(curthread, NULL);
