@@ -265,7 +265,7 @@ isal_process(device_t dev, struct cryptop *crp, int hint)
 	uint8_t tag[16];
 	size_t inlen, outlen, resid, todo;
 	int error;
-	bool aad_allocated;
+	bool aad_allocated, fpu_entered;
 
 	aad_allocated = false;
 	if ((crp->crp_flags & CRYPTO_F_IV_SEPARATE) == 0) {
@@ -296,7 +296,12 @@ isal_process(device_t dev, struct cryptop *crp, int hint)
 	sc = device_get_softc(dev);
 	s = crypto_get_driver_session(crp->crp_session);
 
-	fpu_kern_enter(curthread, NULL, FPU_KERN_NOCTX);
+	if (is_fpu_kern_thread(0)) {
+		fpu_entered = false;
+	} else {
+		fpu_kern_enter(curthread, NULL, FPU_KERN_NOCTX);
+		fpu_entered = true;
+	}
 
 	if (crp->crp_cipher_key != NULL)
 		s->aes_gcm_pre(crp->crp_cipher_key, &s->key_data);
@@ -420,7 +425,8 @@ isal_process(device_t dev, struct cryptop *crp, int hint)
 		counter_u64_add(sc->sc_gcm_decrypt, 1);
 	}
 
-	fpu_kern_leave(curthread, NULL);
+	if (fpu_entered)
+		fpu_kern_leave(curthread, NULL);
 
 	explicit_bzero(&tag, sizeof(tag));
 	explicit_bzero(&context_data, sizeof(context_data));
