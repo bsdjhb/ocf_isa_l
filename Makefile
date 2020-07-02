@@ -42,7 +42,21 @@ YASM?=	${LOCALBASE}/bin/yasm
 	${YASM} -g dwarf2 -f elf64 ${INCS} -o ${.TARGET} ${.IMPSRC}
 
 KMOD=	isal
-SRCS=	gcm128_avx_gen2.asm \
+SRCS=	cbc_dec_128_x4_sse.asm \
+	cbc_dec_128_x8_avx.asm \
+	cbc_dec_192_x4_sse.asm \
+	cbc_dec_192_x8_avx.asm \
+	cbc_dec_256_x4_sse.asm \
+	cbc_dec_256_x8_avx.asm \
+	cbc_enc_128_x4_sb.asm \
+	cbc_enc_128_x8_sb.asm \
+	cbc_enc_192_x4_sb.asm \
+	cbc_enc_192_x8_sb.asm \
+	cbc_enc_256_x4_sb.asm \
+	cbc_enc_256_x8_sb.asm \
+	cbc_multibinary.asm \
+	cbc_pre.c \
+	gcm128_avx_gen2.asm \
 	gcm128_avx_gen4.asm \
 	gcm128_sse.asm \
 	gcm256_avx_gen2.asm \

@@ -41,17 +41,29 @@
 
 #include "cryptodev_if.h"
 
+#include <aes_cbc.h>
 #include <aes_gcm.h>
 
 struct isal_softc {
 	int32_t	sc_cid;
 
+	counter_u64_t sc_cbc_encrypt;
+	counter_u64_t sc_cbc_decrypt;
+	counter_u64_t sc_cbc_aligned_bytes;
+	counter_u64_t sc_cbc_bounced_bytes;
 	counter_u64_t sc_gcm_encrypt;
 	counter_u64_t sc_gcm_decrypt;
 	counter_u64_t sc_gcm_update_bytes;
 	counter_u64_t sc_gcm_update_nt_bytes;
 	counter_u64_t sc_gcm_update_calls;
 	counter_u64_t sc_gcm_update_nt_calls;
+};
+
+struct isal_cbc_session {
+	void (*dec)(void *, uint8_t *, uint8_t *, void *, uint64_t);
+	int (*enc)(void *, uint8_t *, uint8_t *, void *, uint64_t);
+
+	struct cbc_key_data key_data __aligned(16);
 };
 
 struct isal_gcm_session {
@@ -78,10 +90,13 @@ struct isal_session {
 	int	(*process)(struct isal_softc *, struct cryptop *,
 		    struct isal_session *);
 	union {
+		struct isal_cbc_session cbc;
 		struct isal_gcm_session gcm;
 	};
 };
 
+static int isal_process_cbc(struct isal_softc *, struct cryptop *,
+    struct isal_session *);
 static int isal_process_gcm(struct isal_softc *, struct cryptop *,
     struct isal_session *);
 
@@ -127,6 +142,18 @@ isal_sysctls(device_t dev, struct isal_softc *sc)
 	    CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, "statistics");
 	children = SYSCTL_CHILDREN(oid);
 
+	SYSCTL_ADD_COUNTER_U64(ctx, children, OID_AUTO, "cbc_encrypt",
+	    CTLFLAG_RD, &sc->sc_cbc_encrypt,
+	    "AES-CBC encryption requests completed");
+	SYSCTL_ADD_COUNTER_U64(ctx, children, OID_AUTO, "cbc_decrypt",
+	    CTLFLAG_RD, &sc->sc_cbc_decrypt,
+	    "AES-CBC decryption requests completed");
+	SYSCTL_ADD_COUNTER_U64(ctx, children, OID_AUTO, "cbc_aligned_bytes",
+	    CTLFLAG_RD, &sc->sc_cbc_aligned_bytes,
+	    "Bytes encrypted/decrypted by AES-CBC without bouncing");
+	SYSCTL_ADD_COUNTER_U64(ctx, children, OID_AUTO, "cbc_bounced_bytes",
+	    CTLFLAG_RD, &sc->sc_cbc_bounced_bytes,
+	    "Bytes encrypted/decrypted by AES-CBC with bouncing");
 	SYSCTL_ADD_COUNTER_U64(ctx, children, OID_AUTO, "gcm_encrypt",
 	    CTLFLAG_RD, &sc->sc_gcm_encrypt,
 	    "AES-GCM encryption requests completed");
@@ -162,6 +189,10 @@ isal_attach(device_t dev)
 		return (ENXIO);
 	}
 
+	sc->sc_cbc_encrypt = counter_u64_alloc(M_WAITOK);
+	sc->sc_cbc_decrypt = counter_u64_alloc(M_WAITOK);
+	sc->sc_cbc_aligned_bytes = counter_u64_alloc(M_WAITOK);
+	sc->sc_cbc_bounced_bytes = counter_u64_alloc(M_WAITOK);
 	sc->sc_gcm_encrypt = counter_u64_alloc(M_WAITOK);
 	sc->sc_gcm_decrypt = counter_u64_alloc(M_WAITOK);
 	sc->sc_gcm_update_bytes = counter_u64_alloc(M_WAITOK);
@@ -182,6 +213,10 @@ isal_detach(device_t dev)
 
 	crypto_unregister_all(sc->sc_cid);
 
+	counter_u64_free(sc->sc_cbc_encrypt);
+	counter_u64_free(sc->sc_cbc_decrypt);
+	counter_u64_free(sc->sc_cbc_aligned_bytes);
+	counter_u64_free(sc->sc_cbc_bounced_bytes);
 	counter_u64_free(sc->sc_gcm_encrypt);
 	counter_u64_free(sc->sc_gcm_decrypt);
 	counter_u64_free(sc->sc_gcm_update_bytes);
@@ -199,6 +234,20 @@ isal_probesession(device_t dev, const struct crypto_session_params *csp)
 	    0)
 		return (EINVAL);
 	switch (csp->csp_mode) {
+	case CSP_MODE_CIPHER:
+		switch (csp->csp_cipher_alg) {
+		case CRYPTO_AES_CBC:
+			if (csp->csp_ivlen != 16)
+				return (EINVAL);
+			if (csp->csp_cipher_klen != 16 &&
+			    csp->csp_cipher_klen != 24 &&
+			    csp->csp_cipher_klen != 32)
+				return (EINVAL);
+			break;
+		default:
+			return (EINVAL);
+		}
+		break;
 	case CSP_MODE_AEAD:
 		switch (csp->csp_cipher_alg) {
 		case CRYPTO_AES_NIST_GCM_16:
@@ -221,6 +270,37 @@ isal_probesession(device_t dev, const struct crypto_session_params *csp)
 
 	/* Prefer to aesni(4). */
 	return (CRYPTODEV_PROBE_ACCEL_SOFTWARE + 10);
+}
+
+static void
+isal_newsession_cbc(const struct crypto_session_params *csp,
+    struct isal_session *s)
+{
+	switch (csp->csp_cipher_klen) {
+	case 16:
+		s->cbc.dec = aes_cbc_dec_128;
+		s->cbc.enc = aes_cbc_enc_128;
+		break;
+	case 24:
+		s->cbc.dec = aes_cbc_dec_192;
+		s->cbc.enc = aes_cbc_enc_192;
+		break;
+	case 32:
+		s->cbc.dec = aes_cbc_dec_256;
+		s->cbc.enc = aes_cbc_enc_256;
+		break;
+	default:
+		__assert_unreachable();
+	}
+
+	if (csp->csp_cipher_key != NULL) {
+		fpu_kern_enter(curthread, NULL, FPU_KERN_NOCTX);
+		aes_cbc_precomp(__DECONST(void *, csp->csp_cipher_key),
+		    csp->csp_cipher_klen, &s->cbc.key_data);
+		fpu_kern_leave(curthread, NULL);
+	}
+
+	s->process = isal_process_cbc;
 }
 
 static void
@@ -264,7 +344,135 @@ isal_newsession(device_t dev, crypto_session_t cses,
 
 	s = crypto_get_driver_session(cses);
 
-	isal_newsession_gcm(csp, s);
+	switch (csp->csp_mode) {
+	case CSP_MODE_CIPHER:
+		switch (csp->csp_cipher_alg) {
+		case CRYPTO_AES_CBC:
+			isal_newsession_cbc(csp, s);
+			break;
+		default:
+			__assert_unreachable();
+		}
+		break;
+	case CSP_MODE_AEAD:
+		switch (csp->csp_cipher_alg) {
+		case CRYPTO_AES_NIST_GCM_16:
+			isal_newsession_gcm(csp, s);
+			break;
+		default:
+			__assert_unreachable();
+		}
+		break;
+	default:
+		__assert_unreachable();
+	}
+
+	return (0);
+}
+
+static int
+isal_process_cbc(struct isal_softc *sc, struct cryptop *crp,
+    struct isal_session *s)
+{
+	struct crypto_buffer_cursor cc_in, cc_out;
+	uint8_t blocks[AES_BLOCK_LEN * 4] __aligned(64);
+	uint8_t iv[AES_BLOCK_LEN] __aligned(16);
+	uint8_t *in, *out;
+	size_t inlen, outlen, resid, todo;
+	bool fpu_entered;
+
+	if (is_fpu_kern_thread(0)) {
+		fpu_entered = false;
+	} else {
+		fpu_kern_enter(curthread, NULL, FPU_KERN_NOCTX);
+		fpu_entered = true;
+	}
+
+	if (crp->crp_cipher_key != NULL) {
+		const struct crypto_session_params *csp;
+
+		csp = crypto_get_params(crp->crp_session);
+		aes_cbc_precomp(__DECONST(void *, crp->crp_cipher_key),
+		    csp->csp_cipher_klen, &s->cbc.key_data);
+	}
+
+	crypto_read_iv(crp, iv);
+
+	crypto_cursor_init(&cc_in, &crp->crp_buf);
+	crypto_cursor_advance(&cc_in, crp->crp_payload_start);
+	resid = crp->crp_payload_length;
+	if (CRYPTO_HAS_OUTPUT_BUFFER(crp)) {
+		crypto_cursor_init(&cc_out, &crp->crp_obuf);
+		crypto_cursor_advance(&cc_out, crp->crp_payload_output_start);
+	} else
+		cc_out = cc_in;
+
+	in = crypto_cursor_segbase(&cc_in);
+	inlen = crypto_cursor_seglen(&cc_in);
+	out = crypto_cursor_segbase(&cc_out);
+	outlen = crypto_cursor_seglen(&cc_out);
+	while (resid > 0) {
+		if (outlen < 16 || (uintptr_t)out % 16 != 0) {
+			out = blocks;
+			outlen = sizeof(blocks);
+		}
+		if (inlen < 16 || (uintptr_t)in % 16 != 0) {
+			in = blocks;
+			inlen = sizeof(blocks);
+		}
+
+		todo = MIN(rounddown2(MIN(inlen, outlen), 16), resid);
+		if (in == blocks)
+			crypto_cursor_copydata(&cc_in, todo, in);
+
+		if (CRYPTO_OP_IS_ENCRYPT(crp->crp_op))
+			s->cbc.enc(in, iv, s->cbc.key_data.enc_keys, out, todo);
+		else
+			s->cbc.dec(in, iv, s->cbc.key_data.dec_keys, out, todo);
+		memcpy(iv, out + todo - AES_BLOCK_LEN, AES_BLOCK_LEN);
+
+		if (in == blocks || out == blocks)
+			counter_u64_add(sc->sc_cbc_bounced_bytes, todo);
+		else
+			counter_u64_add(sc->sc_cbc_aligned_bytes, todo);
+
+		if (in == blocks) {
+			in = crypto_cursor_segbase(&cc_in);
+			inlen = crypto_cursor_seglen(&cc_in);
+		} else {
+			crypto_cursor_advance(&cc_in, todo);
+			in += todo;
+			inlen -= todo;
+			if (inlen == 0) {
+				in = crypto_cursor_segbase(&cc_in);
+				inlen = crypto_cursor_seglen(&cc_in);
+			}
+		};
+
+		if (out == blocks) {
+			crypto_cursor_copyback(&cc_out, todo, out);
+			out = crypto_cursor_segbase(&cc_out);
+			outlen = crypto_cursor_seglen(&cc_out);
+		} else {
+			crypto_cursor_advance(&cc_out, todo);
+			out += todo;
+			outlen -= todo;
+			if (outlen == 0) {
+				out = crypto_cursor_segbase(&cc_out);
+				outlen = crypto_cursor_seglen(&cc_out);
+			}
+		}
+
+		resid -= todo;
+	};
+
+	if (CRYPTO_OP_IS_ENCRYPT(crp->crp_op))
+		counter_u64_add(sc->sc_cbc_encrypt, 1);
+	else
+		counter_u64_add(sc->sc_cbc_decrypt, 1);
+
+	if (fpu_entered)
+		fpu_kern_leave(curthread, NULL);
 
 	return (0);
 }
