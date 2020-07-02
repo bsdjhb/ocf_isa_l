@@ -27,14 +27,14 @@
 #
 
 ISASRC?=${.CURDIR}/isa-l_crypto
-ISAINC=	${ISASRC}/include
-ISAAES=	${ISASRC}/aes
-INCS=	-I${ISAINC} -I${ISAAES} -I${.CURDIR}/include
+INCS=	-I${ISASRC}/include -I${ISASRC}/aes
+INCS+=	-I${ISASRC}/mh_sha1 -I${ISASRC}/mh_sha256
+INCS+=	-I${.CURDIR}/include
 CFLAGS+=${INCS}
 LOCALBASE?=/usr/local
 YASM?=	${LOCALBASE}/bin/yasm
 
-.PATH: ${ISASRC}/aes
+.PATH: ${ISASRC}/aes ${ISASRC}/mh_sha1  ${ISASRC}/mh_sha256
 
 .SUFFIXES: .asm
 
@@ -75,9 +75,32 @@ SRCS=	cbc_dec_128_x4_sse.asm \
 	keyexp_192.asm \
 	keyexp_256.asm \
 	keyexp_multibinary.asm \
+	mh_sha1_block_avx.asm \
+	mh_sha1_block_avx2.asm \
+	mh_sha1_block_sse.asm \
+	mh_sha1_multibinary.asm \
+	mh_sha1.c \
+	mh_sha1_block_base.c \
+	mh_sha1_finalize_base.c \
+	mh_sha1_update_base.c \
+	sha1_for_mh_sha1.c \
+	mh_sha256_block_avx.asm \
+	mh_sha256_block_avx2.asm \
+	mh_sha256_block_sse.asm \
+	mh_sha256_multibinary.asm \
+	mh_sha256.c \
+	mh_sha256_block_base.c \
+	mh_sha256_finalize_base.c \
+	mh_sha256_update_base.c \
+	sha256_for_mh_sha256.c \
 	isal_ocf.c \
 	bus_if.h \
 	cryptodev_if.h \
 	device_if.h
+
+CWARNFLAGS.mh_sha1_block_base.c+=-Wno-missing-prototypes ${NO_WCAST_QUAL}
+CWARNFLAGS.mh_sha256_block_base.c+=-Wno-missing-prototypes ${NO_WCAST_QUAL}
+CWARNFLAGS.sha1_for_mh_sha1.c+=${NO_WCAST_QUAL}
+CWARNFLAGS.sha256_for_mh_sha256.c+=${NO_WCAST_QUAL}
 
 .include <bsd.kmod.mk>

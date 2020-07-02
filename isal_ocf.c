@@ -43,9 +43,12 @@
 
 #include <aes_cbc.h>
 #include <aes_gcm.h>
+#include <mh_sha1.h>
+#include <mh_sha256.h>
 
 struct isal_softc {
 	int32_t	sc_cid;
+	bool has_aes;
 
 	counter_u64_t sc_cbc_encrypt;
 	counter_u64_t sc_cbc_decrypt;
@@ -86,12 +89,30 @@ struct isal_gcm_session {
 	    struct gcm_context_data *, uint8_t *, uint64_t);
 };
 
+union isal_sha_ctx {
+	struct mh_sha1_ctx sha1;
+	struct mh_sha256_ctx sha256;
+};
+
+struct isal_sha_session {
+	union isal_sha_ctx ipad_ctx;
+	union isal_sha_ctx opad_ctx;
+
+	int (*init)(void *);
+	int (*update)(void *, const void *, uint32_t);
+	int (*finalize)(void *, void *);
+	int hash_len;
+	int mlen;
+	bool hmac;
+};
+
 struct isal_session {
 	int	(*process)(struct isal_softc *, struct cryptop *,
 		    struct isal_session *);
 	union {
 		struct isal_cbc_session cbc;
 		struct isal_gcm_session gcm;
+		struct isal_sha_session sha;
 	};
 };
 
@@ -99,12 +120,14 @@ static int isal_process_cbc(struct isal_softc *, struct cryptop *,
     struct isal_session *);
 static int isal_process_gcm(struct isal_softc *, struct cryptop *,
     struct isal_session *);
+static int isal_process_sha(struct isal_softc *, struct cryptop *,
+    struct isal_session *);
 
 static MALLOC_DEFINE(M_ISAL, "isal", "ISA-L crypto");
 
 /* Base AES routines all require AESNI and SSE4.1. */
 static bool
-cpu_supported(void)
+aes_supported(void)
 {
 	return ((cpu_feature2 & (CPUID2_SSE41 | CPUID2_AESNI)) ==
 	    (CPUID2_SSE41 | CPUID2_AESNI));
@@ -114,7 +137,7 @@ static void
 isal_identify(driver_t *driver, device_t parent)
 {
 
-	if (cpu_supported() && device_find_child(parent, "isal", -1) == NULL)
+	if (device_find_child(parent, "isal", -1) == NULL)
 		BUS_ADD_CHILD(parent, 10, "isal", -1);
 }
 
@@ -181,6 +204,8 @@ isal_attach(device_t dev)
 
 	sc = device_get_softc(dev);
 
+	sc->has_aes = aes_supported();
+
 	sc->sc_cid = crypto_get_driverid(dev, sizeof(struct isal_session),
 	    CRYPTOCAP_F_SOFTWARE | CRYPTOCAP_F_SYNC |
 	    CRYPTOCAP_F_ACCEL_SOFTWARE);
@@ -229,14 +254,29 @@ isal_detach(device_t dev)
 static int
 isal_probesession(device_t dev, const struct crypto_session_params *csp)
 {
+	struct isal_softc *sc;
 
+	sc = device_get_softc(dev);
 	if ((csp->csp_flags & ~(CSP_F_SEPARATE_OUTPUT | CSP_F_SEPARATE_AAD)) !=
 	    0)
 		return (EINVAL);
 	switch (csp->csp_mode) {
+	case CSP_MODE_DIGEST:
+		switch (csp->csp_auth_alg) {
+		case CRYPTO_SHA1:
+		case CRYPTO_SHA1_HMAC:
+		case CRYPTO_SHA2_256:
+		case CRYPTO_SHA2_256_HMAC:
+			break;
+		default:
+			return (EINVAL);
+		}
+		break;
 	case CSP_MODE_CIPHER:
 		switch (csp->csp_cipher_alg) {
 		case CRYPTO_AES_CBC:
+			if (!sc->has_aes)
+				return (ENXIO);
 			if (csp->csp_ivlen != 16)
 				return (EINVAL);
 			if (csp->csp_cipher_klen != 16 &&
@@ -251,6 +291,8 @@ isal_probesession(device_t dev, const struct crypto_session_params *csp)
 	case CSP_MODE_AEAD:
 		switch (csp->csp_cipher_alg) {
 		case CRYPTO_AES_NIST_GCM_16:
+			if (!sc->has_aes)
+				return (ENXIO);
 			if (csp->csp_auth_mlen != 0 &&
 			    csp->csp_auth_mlen != 16)
 				return (EINVAL);
@@ -336,6 +378,91 @@ isal_newsession_gcm(const struct crypto_session_params *csp,
 	s->process = isal_process_gcm;
 }
 
+_Static_assert(SHA1_BLOCK_LEN == SHA2_256_BLOCK_LEN,
+    "This code assumes all supported SHA digests use the same block length");
+
+static void
+isal_init_sha_hmac_pads(const struct crypto_session_params *csp,
+    struct isal_session *s, const void *key)
+{
+	union isal_sha_ctx ctx;
+	uint8_t hmac_key[SHA2_256_BLOCK_LEN];
+	u_int i;
+
+	/*
+	 * If the key is larger than the block size, use the digest of
+	 * the key as the key instead.
+	 */
+	memset(hmac_key, 0, sizeof(hmac_key));
+	if (csp->csp_auth_klen > sizeof(hmac_key)) {
+		s->sha.init(&ctx);
+		s->sha.update(&ctx, key, csp->csp_auth_klen);
+		s->sha.finalize(&ctx, hmac_key);
+	} else
+		memcpy(hmac_key, key, csp->csp_auth_klen);
+
+	for (i = 0; i < sizeof(hmac_key); i++)
+		hmac_key[i] ^= HMAC_IPAD_VAL;
+
+	s->sha.init(&s->sha.ipad_ctx);
+	s->sha.update(&s->sha.ipad_ctx, hmac_key, sizeof(hmac_key));
+
+	for (i = 0; i < sizeof(hmac_key); i++) {
+		hmac_key[i] ^= HMAC_IPAD_VAL;
+		hmac_key[i] ^= HMAC_OPAD_VAL;
+	}
+
+	s->sha.init(&s->sha.opad_ctx);
+	s->sha.update(&s->sha.opad_ctx, hmac_key, sizeof(hmac_key));
+	explicit_bzero(hmac_key, sizeof(hmac_key));
+}
+
+static void
+isal_newsession_sha(const struct crypto_session_params *csp,
+    struct isal_session *s)
+{
+	switch (csp->csp_auth_alg) {
+	case CRYPTO_SHA1_HMAC:
+	case CRYPTO_SHA2_256_HMAC:
+		s->sha.hmac = true;
+		break;
+	}
+
+	switch (csp->csp_auth_alg) {
+	case CRYPTO_SHA1:
+	case CRYPTO_SHA1_HMAC:
+		s->sha.init = (int (*)(void *))mh_sha1_init;
+		s->sha.update =
+		    (int (*)(void *, const void *, uint32_t))mh_sha1_update;
+		s->sha.finalize = (int (*)(void *, void *))mh_sha1_finalize;
+		s->sha.hash_len = SHA1_HASH_LEN;
+		break;
+	case CRYPTO_SHA2_256:
+	case CRYPTO_SHA2_256_HMAC:
+		s->sha.init = (int (*)(void *))mh_sha256_init;
+		s->sha.update =
+		    (int (*)(void *, const void *, uint32_t))mh_sha256_update;
+		s->sha.finalize = (int (*)(void *, void *))mh_sha256_finalize;
+		s->sha.hash_len = SHA2_256_HASH_LEN;
+		break;
+	default:
+		__assert_unreachable();
+	}
+
+	if (csp->csp_auth_mlen != 0)
+		s->sha.mlen = csp->csp_auth_mlen;
+	else
+		s->sha.mlen = s->sha.hash_len;
+
+	if (csp->csp_auth_key != NULL) {
+		fpu_kern_enter(curthread, NULL, FPU_KERN_NOCTX);
+		isal_init_sha_hmac_pads(csp, s, csp->csp_auth_key);
+		fpu_kern_leave(curthread, NULL);
+	}
+
+	s->process = isal_process_sha;
+}
+
 static int
 isal_newsession(device_t dev, crypto_session_t cses,
     const struct crypto_session_params *csp)
@@ -345,6 +472,9 @@ isal_newsession(device_t dev, crypto_session_t cses,
 	s = crypto_get_driver_session(cses);
 
 	switch (csp->csp_mode) {
+	case CSP_MODE_DIGEST:
+		isal_newsession_sha(csp, s);
+		break;
 	case CSP_MODE_CIPHER:
 		switch (csp->csp_cipher_alg) {
 		case CRYPTO_AES_CBC:
@@ -653,6 +783,91 @@ isal_process_gcm(struct isal_softc *sc, struct cryptop *crp,
 
 	if (aad_allocated)
 		free(aad, M_ISAL);
+	return (error);
+}
+
+static int
+isal_process_sha(struct isal_softc *sc, struct cryptop *crp,
+    struct isal_session *s)
+{
+	union isal_sha_ctx ctx;
+	struct crypto_buffer_cursor cc;
+	u_int hash[SHA2_256_HASH_LEN];
+	size_t resid, todo;
+	int error;
+	bool fpu_entered;
+
+	if (is_fpu_kern_thread(0)) {
+		fpu_entered = false;
+	} else {
+		fpu_kern_enter(curthread, NULL, FPU_KERN_NOCTX);
+		fpu_entered = true;
+	}
+
+	if (crp->crp_auth_key != NULL) {
+		const struct crypto_session_params *csp;
+
+		csp = crypto_get_params(crp->crp_session);
+		isal_init_sha_hmac_pads(csp, s, crp->crp_auth_key);
+	}
+
+	if (s->sha.hmac)
+		ctx = s->sha.ipad_ctx;
+	else
+		s->sha.init(&ctx);
+
+	if (crp->crp_aad != NULL)
+		s->sha.update(&ctx, crp->crp_aad, crp->crp_aad_length);
+	else if (crp->crp_aad_length != 0) {
+		crypto_cursor_init(&cc, &crp->crp_buf);
+		crypto_cursor_advance(&cc, crp->crp_aad_start);
+		resid = crp->crp_aad_length;
+		for (;;) {
+			todo = MIN(MIN(resid, crypto_cursor_seglen(&cc)),
+			    UINT32_MAX);
+			s->sha.update(&ctx, crypto_cursor_segbase(&cc), todo);
+			resid -= todo;
+			if (resid == 0)
+				break;
+			crypto_cursor_advance(&cc, todo);
+		}
+	}
+
+	crypto_cursor_init(&cc, &crp->crp_buf);
+	crypto_cursor_advance(&cc, crp->crp_payload_start);
+	resid = crp->crp_payload_length;
+	while (resid > 0) {
+		todo = MIN(MIN(resid, crypto_cursor_seglen(&cc)), UINT32_MAX);
+		s->sha.update(&ctx, crypto_cursor_segbase(&cc), todo);
+		resid -= todo;
+		if (resid == 0)
+			break;
+		crypto_cursor_advance(&cc, todo);
+	}
+
+	s->sha.finalize(&ctx, hash);
+	if (s->sha.hmac) {
+		ctx = s->sha.opad_ctx;
+		s->sha.update(&ctx, hash, s->sha.hash_len);
+		s->sha.finalize(&ctx, hash);
+	}
+
+	if (fpu_entered)
+		fpu_kern_leave(curthread, NULL);
+
+	error = 0;
+	if (crp->crp_op & CRYPTO_OP_VERIFY_DIGEST) {
+		uint8_t hash2[SHA2_256_HASH_LEN];
+
+		crypto_copydata(crp, crp->crp_digest_start, s->sha.mlen, hash2);
+		if (timingsafe_bcmp(hash, hash2, s->sha.mlen) != 0)
+			error = EBADMSG;
+		explicit_bzero(&hash2, sizeof(hash2));
+	} else
+		crypto_copyback(crp, crp->crp_digest_start, s->sha.mlen, hash);
+
+	explicit_bzero(&hash, sizeof(hash));
+	explicit_bzero(&ctx, sizeof(ctx));
 	return (error);
 }
 
