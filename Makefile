@@ -56,20 +56,14 @@ SRCS=	gcm128_avx_gen2.asm \
 	gcm256_avx_gen4_nt.asm \
 	gcm256_sse_nt.asm \
 	gcm_multibinary_nt.asm \
+	gcm_pre.c \
 	keyexp_128.asm \
 	keyexp_192.asm \
 	keyexp_256.asm \
 	keyexp_multibinary.asm \
-	gcm_pre.c \
 	isal_ocf.c \
 	bus_if.h \
 	cryptodev_if.h \
 	device_if.h
-
-NOT=	keyexp_128.asm \
-	keyexp_256.asm \
-	keyexp_multibinary.asm \
-	keyexp_192.asm \
-	not.c
 
 .include <bsd.kmod.mk>
