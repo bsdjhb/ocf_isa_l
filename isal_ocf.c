@@ -376,9 +376,10 @@ isal_process_cbc(struct isal_softc *sc, struct cryptop *crp,
 {
 	struct crypto_buffer_cursor cc_in, cc_out;
 	uint8_t blocks[AES_BLOCK_LEN * 4] __aligned(64);
-	uint8_t iv[AES_BLOCK_LEN] __aligned(16);
+	uint8_t iv[2][AES_BLOCK_LEN] __aligned(16);
 	uint8_t *in, *out;
 	size_t inlen, outlen, resid, todo;
+	u_int iv_index;
 	bool fpu_entered;
 
 	if (is_fpu_kern_thread(0)) {
@@ -396,7 +397,8 @@ isal_process_cbc(struct isal_softc *sc, struct cryptop *crp,
 		    csp->csp_cipher_klen, &s->cbc.key_data);
 	}
 
-	crypto_read_iv(crp, iv);
+	iv_index = 0;
+	crypto_read_iv(crp, iv[0]);
 
 	crypto_cursor_init(&cc_in, &crp->crp_buf);
 	crypto_cursor_advance(&cc_in, crp->crp_payload_start);
@@ -425,11 +427,18 @@ isal_process_cbc(struct isal_softc *sc, struct cryptop *crp,
 		if (in == blocks)
 			crypto_cursor_copydata(&cc_in, todo, in);
 
-		if (CRYPTO_OP_IS_ENCRYPT(crp->crp_op))
-			s->cbc.enc(in, iv, s->cbc.key_data.enc_keys, out, todo);
-		else
-			s->cbc.dec(in, iv, s->cbc.key_data.dec_keys, out, todo);
-		memcpy(iv, out + todo - AES_BLOCK_LEN, AES_BLOCK_LEN);
+		if (CRYPTO_OP_IS_ENCRYPT(crp->crp_op)) {
+			s->cbc.enc(in, iv[0], s->cbc.key_data.enc_keys, out,
+			    todo);
+			memcpy(iv[0], out + todo - AES_BLOCK_LEN,
+			    AES_BLOCK_LEN);
+		} else {
+			memcpy(iv[iv_index ^ 1], in + todo - AES_BLOCK_LEN,
+			    AES_BLOCK_LEN);
+			s->cbc.dec(in, iv[iv_index], s->cbc.key_data.dec_keys,
+			    out, todo);
+			iv_index ^= 1;
+		}
 
 		if (in == blocks || out == blocks)
 			counter_u64_add(sc->sc_cbc_bounced_bytes, todo);
