@@ -38,6 +38,7 @@
 #include <machine/specialreg.h>
 
 #include <opencrypto/cryptodev.h>
+#include <opencrypto/xform_auth.h>
 
 #include "cryptodev_if.h"
 
@@ -57,6 +58,11 @@ struct isal_softc {
 	counter_u64_t sc_gcm_update_nt_bytes;
 	counter_u64_t sc_gcm_update_calls;
 	counter_u64_t sc_gcm_update_nt_calls;
+#ifdef CSP_MODE_MTE
+	counter_u64_t sc_mte_encrypt;
+	counter_u64_t sc_mte_aligned_bytes;
+	counter_u64_t sc_mte_bounced_bytes;
+#endif
 };
 
 struct isal_cbc_session {
@@ -86,6 +92,13 @@ struct isal_gcm_session {
 	    struct gcm_context_data *, uint8_t *, uint64_t);
 };
 
+struct isal_auth_session {
+	struct auth_hash *axf;
+	void *ictx;
+	void *octx;
+	u_int mlen;
+};
+
 struct isal_session {
 	int	(*process)(struct isal_softc *, struct cryptop *,
 		    struct isal_session *);
@@ -93,12 +106,17 @@ struct isal_session {
 		struct isal_cbc_session cbc;
 		struct isal_gcm_session gcm;
 	};
+	struct isal_auth_session auth;
 };
 
 static int isal_process_cbc(struct isal_softc *, struct cryptop *,
     struct isal_session *);
 static int isal_process_gcm(struct isal_softc *, struct cryptop *,
     struct isal_session *);
+#ifdef CSP_MODE_MTE
+static int isal_process_mte(struct isal_softc *, struct cryptop *,
+    struct isal_session *);
+#endif
 
 static MALLOC_DEFINE(M_ISAL, "isal", "ISA-L crypto");
 
@@ -172,6 +190,17 @@ isal_sysctls(device_t dev, struct isal_softc *sc)
 	SYSCTL_ADD_COUNTER_U64(ctx, children, OID_AUTO, "gcm_update_nt_calls",
 	    CTLFLAG_RD, &sc->sc_gcm_update_nt_calls,
 	    "Calls to non-temporal AES-GCM update functions");
+#ifdef CSP_MODE_MTE
+	SYSCTL_ADD_COUNTER_U64(ctx, children, OID_AUTO, "mte_encrypt",
+	    CTLFLAG_RD, &sc->sc_mte_encrypt,
+	    "AES-CBC MtE encryption requests completed");
+	SYSCTL_ADD_COUNTER_U64(ctx, children, OID_AUTO, "mte_aligned_bytes",
+	    CTLFLAG_RD, &sc->sc_mte_aligned_bytes,
+	    "Bytes encrypted by AES-CBC MtE without bouncing");
+	SYSCTL_ADD_COUNTER_U64(ctx, children, OID_AUTO, "mte_bounced_bytes",
+	    CTLFLAG_RD, &sc->sc_mte_bounced_bytes,
+	    "Bytes encrypted by AES-CBC MtE with bouncing");
+#endif
 }
 
 static int
@@ -199,6 +228,11 @@ isal_attach(device_t dev)
 	sc->sc_gcm_update_nt_bytes = counter_u64_alloc(M_WAITOK);
 	sc->sc_gcm_update_calls = counter_u64_alloc(M_WAITOK);
 	sc->sc_gcm_update_nt_calls = counter_u64_alloc(M_WAITOK);
+#ifdef CSP_MODE_MTE
+	sc->sc_mte_encrypt = counter_u64_alloc(M_WAITOK);
+	sc->sc_mte_aligned_bytes = counter_u64_alloc(M_WAITOK);
+	sc->sc_mte_bounced_bytes = counter_u64_alloc(M_WAITOK);
+#endif
 
 	isal_sysctls(dev, sc);
 	return (0);
@@ -223,6 +257,11 @@ isal_detach(device_t dev)
 	counter_u64_free(sc->sc_gcm_update_nt_bytes);
 	counter_u64_free(sc->sc_gcm_update_calls);
 	counter_u64_free(sc->sc_gcm_update_nt_calls);
+#ifdef CSP_MODE_MTE
+	counter_u64_free(sc->sc_mte_encrypt);
+	counter_u64_free(sc->sc_mte_aligned_bytes);
+	counter_u64_free(sc->sc_mte_bounced_bytes);
+#endif
 	return (0);
 }
 
@@ -264,6 +303,30 @@ isal_probesession(device_t dev, const struct crypto_session_params *csp)
 			return (EINVAL);
 		}
 		break;
+#ifdef CSP_MODE_MTE
+	case CSP_MODE_MTE:
+		switch (csp->csp_cipher_alg) {
+		case CRYPTO_AES_CBC:
+			if (csp->csp_ivlen != 16)
+				return (EINVAL);
+			if (csp->csp_cipher_klen != 16 &&
+			    csp->csp_cipher_klen != 24 &&
+			    csp->csp_cipher_klen != 32)
+				return (EINVAL);
+			break;
+		default:
+			return (EINVAL);
+		}
+		switch (csp->csp_auth_alg) {
+		case CRYPTO_SHA1_HMAC:
+		case CRYPTO_SHA2_256_HMAC:
+		case CRYPTO_SHA2_384_HMAC:
+			break;
+		default:
+			return (EINVAL);
+		}
+		break;
+#endif
 	default:
 		return (EINVAL);
 	}
@@ -273,21 +336,53 @@ isal_probesession(device_t dev, const struct crypto_session_params *csp)
 }
 
 static void
+isal_auth_setkey(const struct crypto_session_params *csp,
+    struct isal_auth_session *auth, const void *key)
+{
+	hmac_init_ipad(auth->axf, key, csp->csp_auth_klen, auth->ictx);
+	hmac_init_opad(auth->axf, key, csp->csp_auth_klen, auth->octx);
+}
+
+static int
+isal_newsession_auth(const struct crypto_session_params *csp,
+    struct isal_auth_session *auth)
+{
+	auth->axf = crypto_auth_hash(csp);
+	auth->ictx = malloc(auth->axf->ctxsize, M_ISAL, M_NOWAIT);
+	auth->octx = malloc(auth->axf->ctxsize, M_ISAL, M_NOWAIT);
+	if (auth->ictx == NULL || auth->octx == NULL) {
+		zfree(auth->ictx, M_ISAL);
+		zfree(auth->octx, M_ISAL);
+		return (ENOMEM);
+	}
+
+	if (csp->csp_auth_mlen == 0)
+		auth->mlen = auth->axf->hashsize;
+	else
+		auth->mlen = csp->csp_auth_mlen;
+
+	if (csp->csp_auth_key != NULL)
+		isal_auth_setkey(csp, auth, csp->csp_auth_key);
+
+	return (0);
+}
+
+static void
 isal_newsession_cbc(const struct crypto_session_params *csp,
-    struct isal_session *s)
+    struct isal_cbc_session *cbc)
 {
 	switch (csp->csp_cipher_klen) {
 	case 16:
-		s->cbc.dec = aes_cbc_dec_128;
-		s->cbc.enc = aes_cbc_enc_128;
+		cbc->dec = aes_cbc_dec_128;
+		cbc->enc = aes_cbc_enc_128;
 		break;
 	case 24:
-		s->cbc.dec = aes_cbc_dec_192;
-		s->cbc.enc = aes_cbc_enc_192;
+		cbc->dec = aes_cbc_dec_192;
+		cbc->enc = aes_cbc_enc_192;
 		break;
 	case 32:
-		s->cbc.dec = aes_cbc_dec_256;
-		s->cbc.enc = aes_cbc_enc_256;
+		cbc->dec = aes_cbc_dec_256;
+		cbc->enc = aes_cbc_enc_256;
 		break;
 	default:
 		__assert_unreachable();
@@ -296,44 +391,40 @@ isal_newsession_cbc(const struct crypto_session_params *csp,
 	if (csp->csp_cipher_key != NULL) {
 		fpu_kern_enter(curthread, NULL, FPU_KERN_NOCTX);
 		aes_cbc_precomp(__DECONST(void *, csp->csp_cipher_key),
-		    csp->csp_cipher_klen, &s->cbc.key_data);
+		    csp->csp_cipher_klen, &cbc->key_data);
 		fpu_kern_leave(curthread, NULL);
 	}
-
-	s->process = isal_process_cbc;
 }
 
 static void
 isal_newsession_gcm(const struct crypto_session_params *csp,
-    struct isal_session *s)
+    struct isal_gcm_session *gcm)
 {
 	if (csp->csp_cipher_klen == 16) {
-		s->gcm.pre = aes_gcm_pre_128;
-		s->gcm.init = aes_gcm_init_128;
-		s->gcm.dec_update = aes_gcm_dec_128_update;
-		s->gcm.dec_update_nt = aes_gcm_dec_128_update_nt;
-		s->gcm.dec_finalize = aes_gcm_dec_128_finalize;
-		s->gcm.enc_update = aes_gcm_enc_128_update;
-		s->gcm.enc_update_nt = aes_gcm_enc_128_update_nt;
-		s->gcm.enc_finalize = aes_gcm_enc_128_finalize;
+		gcm->pre = aes_gcm_pre_128;
+		gcm->init = aes_gcm_init_128;
+		gcm->dec_update = aes_gcm_dec_128_update;
+		gcm->dec_update_nt = aes_gcm_dec_128_update_nt;
+		gcm->dec_finalize = aes_gcm_dec_128_finalize;
+		gcm->enc_update = aes_gcm_enc_128_update;
+		gcm->enc_update_nt = aes_gcm_enc_128_update_nt;
+		gcm->enc_finalize = aes_gcm_enc_128_finalize;
 	} else {
-		s->gcm.pre = aes_gcm_pre_256;
-		s->gcm.init = aes_gcm_init_256;
-		s->gcm.dec_update = aes_gcm_dec_256_update;
-		s->gcm.dec_update_nt = aes_gcm_dec_256_update_nt;
-		s->gcm.dec_finalize = aes_gcm_dec_256_finalize;
-		s->gcm.enc_update = aes_gcm_enc_256_update;
-		s->gcm.enc_update_nt = aes_gcm_enc_256_update_nt;
-		s->gcm.enc_finalize = aes_gcm_enc_256_finalize;
+		gcm->pre = aes_gcm_pre_256;
+		gcm->init = aes_gcm_init_256;
+		gcm->dec_update = aes_gcm_dec_256_update;
+		gcm->dec_update_nt = aes_gcm_dec_256_update_nt;
+		gcm->dec_finalize = aes_gcm_dec_256_finalize;
+		gcm->enc_update = aes_gcm_enc_256_update;
+		gcm->enc_update_nt = aes_gcm_enc_256_update_nt;
+		gcm->enc_finalize = aes_gcm_enc_256_finalize;
 	}
 
 	if (csp->csp_cipher_key != NULL) {
 		fpu_kern_enter(curthread, NULL, FPU_KERN_NOCTX);
-		s->gcm.pre(csp->csp_cipher_key, &s->gcm.key_data);
+		gcm->pre(csp->csp_cipher_key, &gcm->key_data);
 		fpu_kern_leave(curthread, NULL);
 	}
-
-	s->process = isal_process_gcm;
 }
 
 static int
@@ -341,6 +432,9 @@ isal_newsession(device_t dev, crypto_session_t cses,
     const struct crypto_session_params *csp)
 {
 	struct isal_session *s;
+#ifdef CSP_MODE_MTE
+	int error;
+#endif
 
 	s = crypto_get_driver_session(cses);
 
@@ -348,7 +442,8 @@ isal_newsession(device_t dev, crypto_session_t cses,
 	case CSP_MODE_CIPHER:
 		switch (csp->csp_cipher_alg) {
 		case CRYPTO_AES_CBC:
-			isal_newsession_cbc(csp, s);
+			isal_newsession_cbc(csp, &s->cbc);
+			s->process = isal_process_cbc;
 			break;
 		default:
 			__assert_unreachable();
@@ -357,17 +452,38 @@ isal_newsession(device_t dev, crypto_session_t cses,
 	case CSP_MODE_AEAD:
 		switch (csp->csp_cipher_alg) {
 		case CRYPTO_AES_NIST_GCM_16:
-			isal_newsession_gcm(csp, s);
+			isal_newsession_gcm(csp, &s->gcm);
+			s->process = isal_process_gcm;
 			break;
 		default:
 			__assert_unreachable();
 		}
 		break;
+#ifdef CSP_MODE_MTE
+	case CSP_MODE_MTE:
+		isal_newsession_cbc(csp, &s->cbc);
+		error = isal_newsession_auth(csp, &s->auth);
+		if (error)
+			return (error);
+		s->process = isal_process_mte;
+		break;
+#endif
 	default:
 		__assert_unreachable();
 	}
 
 	return (0);
+}
+
+static void
+isal_freesession(device_t dev, crypto_session_t cses)
+{
+	struct isal_session *s;
+
+	s = crypto_get_driver_session(cses);
+
+	zfree(s->auth.ictx, M_ISAL);
+	zfree(s->auth.octx, M_ISAL);
 }
 
 static int
@@ -482,6 +598,9 @@ isal_process_cbc(struct isal_softc *sc, struct cryptop *crp,
 
 	if (fpu_entered)
 		fpu_kern_leave(curthread, NULL);
+
+	explicit_bzero(iv, sizeof(iv));
+	explicit_bzero(blocks, sizeof(blocks));
 
 	return (0);
 }
@@ -665,6 +784,181 @@ isal_process_gcm(struct isal_softc *sc, struct cryptop *crp,
 	return (error);
 }
 
+#ifdef CSP_MODE_MTE
+static int
+isal_process_mte(struct isal_softc *sc, struct cryptop *crp,
+    struct isal_session *s)
+{
+	struct crypto_buffer_cursor cc_in, cc_out;
+	uint8_t blocks[AES_BLOCK_LEN * 4] __aligned(64);
+	uint8_t iv[AES_BLOCK_LEN] __aligned(16);
+	uint8_t mac[HASH_MAX_LEN];
+	uint8_t *in, *out, *macp;
+	size_t inlen, outlen, maclen, resid, tocopy, todo, trailer;
+	struct auth_hash *axf;
+	union authctx ctx;
+	uint8_t pad;
+	bool fpu_entered;
+
+	if (!CRYPTO_OP_IS_ENCRYPT(crp->crp_op))
+		return (EOPNOTSUPP);
+
+	if (crp->crp_auth_key != NULL) {
+		const struct crypto_session_params *csp;
+
+		csp = crypto_get_params(crp->crp_session);
+		isal_auth_setkey(csp, &s->auth, crp->crp_auth_key);
+	}
+
+	axf = s->auth.axf;
+	memcpy(&ctx, s->auth.ictx, axf->ctxsize);
+
+	if (crp->crp_aad != NULL)
+		axf->Update(&ctx, crp->crp_aad, crp->crp_aad_length);
+	else
+		crypto_apply(crp, crp->crp_aad_start, crp->crp_aad_length,
+		    axf->Update, &ctx);
+
+	if (is_fpu_kern_thread(0)) {
+		fpu_entered = false;
+	} else {
+		fpu_kern_enter(curthread, NULL, FPU_KERN_NOCTX);
+		fpu_entered = true;
+	}
+
+	if (crp->crp_cipher_key != NULL) {
+		const struct crypto_session_params *csp;
+
+		csp = crypto_get_params(crp->crp_session);
+		aes_cbc_precomp(__DECONST(void *, crp->crp_cipher_key),
+		    csp->csp_cipher_klen, &s->cbc.key_data);
+	}
+
+	crypto_read_iv(crp, iv);
+
+	crypto_cursor_init(&cc_in, &crp->crp_buf);
+	crypto_cursor_advance(&cc_in, crp->crp_payload_start);
+	resid = crp->crp_payload_length;
+	if (CRYPTO_HAS_OUTPUT_BUFFER(crp)) {
+		crypto_cursor_init(&cc_out, &crp->crp_obuf);
+		crypto_cursor_advance(&cc_out, crp->crp_payload_output_start);
+	} else
+		cc_out = cc_in;
+
+	in = crypto_cursor_segbase(&cc_in);
+	inlen = crypto_cursor_seglen(&cc_in);
+	out = crypto_cursor_segbase(&cc_out);
+	outlen = crypto_cursor_seglen(&cc_out);
+	while (resid >= AES_BLOCK_LEN) {
+		if (outlen < 16 || (uintptr_t)out % 16 != 0) {
+			out = blocks;
+			outlen = sizeof(blocks);
+		}
+		if (inlen < 16 || (uintptr_t)in % 16 != 0) {
+			in = blocks;
+			inlen = sizeof(blocks);
+		}
+
+		todo = rounddown2(MIN(MIN(inlen, outlen), resid), 16);
+		if (in == blocks)
+			crypto_cursor_copydata(&cc_in, todo, in);
+
+		axf->Update(&ctx, in, todo);
+		s->cbc.enc(in, iv, s->cbc.key_data.enc_keys, out, todo);
+		memcpy(iv, out + todo - AES_BLOCK_LEN, AES_BLOCK_LEN);
+
+		if (in == blocks || out == blocks)
+			counter_u64_add(sc->sc_mte_bounced_bytes, todo);
+		else
+			counter_u64_add(sc->sc_mte_aligned_bytes, todo);
+
+		if (in == blocks) {
+			in = crypto_cursor_segbase(&cc_in);
+			inlen = crypto_cursor_seglen(&cc_in);
+		} else {
+			crypto_cursor_advance(&cc_in, todo);
+			in += todo;
+			inlen -= todo;
+			if (inlen == 0) {
+				in = crypto_cursor_segbase(&cc_in);
+				inlen = crypto_cursor_seglen(&cc_in);
+			}
+		};
+
+		if (out == blocks) {
+			crypto_cursor_copyback(&cc_out, todo, out);
+			out = crypto_cursor_segbase(&cc_out);
+			outlen = crypto_cursor_seglen(&cc_out);
+		} else {
+			crypto_cursor_advance(&cc_out, todo);
+			out += todo;
+			outlen -= todo;
+			if (outlen == 0) {
+				out = crypto_cursor_segbase(&cc_out);
+				outlen = crypto_cursor_seglen(&cc_out);
+			}
+		}
+
+		resid -= todo;
+	};
+
+	if (resid > 0) {
+		crypto_cursor_copydata(&cc_in, resid, blocks);
+		axf->Update(&ctx, blocks, resid);
+	}
+
+	axf->Final(mac, &ctx);
+	memcpy(&ctx, s->auth.octx, axf->ctxsize);
+	axf->Update(&ctx, mac, axf->hashsize);
+	axf->Final(mac, &ctx);
+	macp = mac;
+	maclen = s->auth.mlen;
+
+	/*
+	 * All padding bytes hold the count of additional padding
+	 * bytes above the one mandatory padding byte.
+	 */
+	pad = crp->crp_padding_length - 1;
+
+	trailer = maclen + crp->crp_padding_length;
+	while (trailer > 0) {
+		todo = min(trailer + resid, sizeof(blocks));
+		tocopy = min(todo - resid, maclen);
+
+		if (tocopy > 0) {
+			memcpy(blocks + resid, macp, tocopy);
+			macp += tocopy;
+			maclen -= tocopy;
+		}
+
+		if (resid + tocopy < todo) {
+			memset(blocks + resid + tocopy, pad, todo -
+			    (resid + tocopy));
+		}
+
+		s->cbc.enc(blocks, iv, s->cbc.key_data.enc_keys, blocks, todo);
+		memcpy(iv, blocks + todo - AES_BLOCK_LEN, AES_BLOCK_LEN);
+
+		crypto_cursor_copyback(&cc_out, todo, blocks);
+
+		trailer -= todo - resid;
+		resid = 0;
+	}
+
+	counter_u64_add(sc->sc_mte_encrypt, 1);
+
+	if (fpu_entered)
+		fpu_kern_leave(curthread, NULL);
+
+	explicit_bzero(&ctx, sizeof(ctx));
+	explicit_bzero(mac, sizeof(mac));
+	explicit_bzero(iv, sizeof(iv));
+	explicit_bzero(blocks, sizeof(blocks));
+
+	return (0);
+}
+#endif
+
 static int
 isal_process(device_t dev, struct cryptop *crp, int hint)
 {
@@ -690,6 +984,7 @@ static device_method_t isal_methods[] = {
 
 	DEVMETHOD(cryptodev_probesession, isal_probesession),
 	DEVMETHOD(cryptodev_newsession,	isal_newsession),
+	DEVMETHOD(cryptodev_freesession, isal_freesession),
 	DEVMETHOD(cryptodev_process,	isal_process),
 
 	DEVMETHOD_END
