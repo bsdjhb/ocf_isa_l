@@ -40,6 +40,8 @@
 #include <opencrypto/cryptodev.h>
 #include <opencrypto/xform_auth.h>
 
+#include <crypto/ossl/ossl.h>
+
 #include "cryptodev_if.h"
 
 #include <aes_cbc.h>
@@ -335,6 +337,21 @@ isal_probesession(device_t dev, const struct crypto_session_params *csp)
 	return (CRYPTODEV_PROBE_ACCEL_SOFTWARE + 10);
 }
 
+static struct auth_hash *
+isal_auth_hash(const struct crypto_session_params *csp)
+{
+	switch (csp->csp_auth_alg) {
+	case CRYPTO_SHA1_HMAC:
+		return (&ossl_hash_sha1);
+	case CRYPTO_SHA2_256_HMAC:
+		return (&ossl_hash_sha256);
+	case CRYPTO_SHA2_384_HMAC:
+		return (&ossl_hash_sha384);
+	default:
+		__assert_unreachable();
+	}
+}
+
 static void
 isal_auth_setkey(const struct crypto_session_params *csp,
     struct isal_auth_session *auth, const void *key)
@@ -347,7 +364,7 @@ static int
 isal_newsession_auth(const struct crypto_session_params *csp,
     struct isal_auth_session *auth)
 {
-	auth->axf = crypto_auth_hash(csp);
+	auth->axf = isal_auth_hash(csp);
 	auth->ictx = malloc(auth->axf->ctxsize, M_ISAL, M_NOWAIT);
 	auth->octx = malloc(auth->axf->ctxsize, M_ISAL, M_NOWAIT);
 	if (auth->ictx == NULL || auth->octx == NULL) {
@@ -361,8 +378,11 @@ isal_newsession_auth(const struct crypto_session_params *csp,
 	else
 		auth->mlen = csp->csp_auth_mlen;
 
-	if (csp->csp_auth_key != NULL)
+	if (csp->csp_auth_key != NULL) {
+		fpu_kern_enter(curthread, NULL, FPU_KERN_NOCTX);
 		isal_auth_setkey(csp, auth, csp->csp_auth_key);
+		fpu_kern_leave(curthread, NULL);
+	}
 
 	return (0);
 }
@@ -803,6 +823,13 @@ isal_process_mte(struct isal_softc *sc, struct cryptop *crp,
 	if (!CRYPTO_OP_IS_ENCRYPT(crp->crp_op))
 		return (EOPNOTSUPP);
 
+	if (is_fpu_kern_thread(0)) {
+		fpu_entered = false;
+	} else {
+		fpu_kern_enter(curthread, NULL, FPU_KERN_NOCTX);
+		fpu_entered = true;
+	}
+
 	if (crp->crp_auth_key != NULL) {
 		const struct crypto_session_params *csp;
 
@@ -818,13 +845,6 @@ isal_process_mte(struct isal_softc *sc, struct cryptop *crp,
 	else
 		crypto_apply(crp, crp->crp_aad_start, crp->crp_aad_length,
 		    axf->Update, &ctx);
-
-	if (is_fpu_kern_thread(0)) {
-		fpu_entered = false;
-	} else {
-		fpu_kern_enter(curthread, NULL, FPU_KERN_NOCTX);
-		fpu_entered = true;
-	}
 
 	if (crp->crp_cipher_key != NULL) {
 		const struct crypto_session_params *csp;
@@ -1001,3 +1021,4 @@ static devclass_t isal_devclass;
 DRIVER_MODULE(isal, nexus, isal_driver, isal_devclass, NULL, NULL);
 MODULE_VERSION(isal, 1);
 MODULE_DEPEND(isal, crypto, 1, 1, 1);
+MODULE_DEPEND(isal, ossl, 1, 1, 1);
