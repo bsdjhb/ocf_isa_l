@@ -26,7 +26,7 @@
  * THE POSSIBILITY OF SUCH DAMAGES.
  */
 
-#include <sys/types.h>
+#include <sys/param.h>
 #include <sys/bus.h>
 #include <sys/counter.h>
 #include <sys/kernel.h>
@@ -42,6 +42,15 @@
 #include "cryptodev_if.h"
 
 #include <aes_gcm.h>
+
+#if __FreeBSD_version < 1400017
+static __inline void *
+crypto_cursor_segment(struct crypto_buffer_cursor *cc, size_t *len)
+{
+	*len = crypto_cursor_seglen(cc);
+	return (crypto_cursor_segbase(cc));
+}
+#endif
 
 struct isal_softc {
 	int32_t	sc_cid;
@@ -323,10 +332,8 @@ isal_process(device_t dev, struct cryptop *crp, int hint)
 		crypto_cursor_init(&cc_out, &crp->crp_obuf);
 		crypto_cursor_advance(&cc_out, crp->crp_payload_output_start);
 
-		in = crypto_cursor_segbase(&cc_in);
-		inlen = crypto_cursor_seglen(&cc_in);
-		out = crypto_cursor_segbase(&cc_out);
-		outlen = crypto_cursor_seglen(&cc_out);
+		in = crypto_cursor_segment(&cc_in, &inlen);
+		out = crypto_cursor_segment(&cc_out, &outlen);
 
 		/*
 		 * Use aes_gcm_update_nt so long as both buffers are
@@ -343,18 +350,16 @@ isal_process(device_t dev, struct cryptop *crp, int hint)
 
 			crypto_cursor_advance(&cc_in, todo);
 			inlen -= todo;
-			if (inlen == 0) {
-				in = crypto_cursor_segbase(&cc_in);
-				inlen = crypto_cursor_seglen(&cc_in);
-			} else
+			if (inlen == 0)
+				in = crypto_cursor_segment(&cc_in, &inlen);
+			else
 				in += todo;
 
 			crypto_cursor_advance(&cc_out, todo);
 			outlen -= todo;
-			if (outlen == 0) {
-				out = crypto_cursor_segbase(&cc_out);
-				outlen = crypto_cursor_seglen(&cc_out);
-			} else
+			if (outlen == 0)
+				out = crypto_cursor_segment(&cc_out, &outlen);
+			else
 				out += todo;
 
 			resid -= todo;
@@ -374,18 +379,16 @@ isal_process(device_t dev, struct cryptop *crp, int hint)
 
 			crypto_cursor_advance(&cc_in, todo);
 			inlen -= todo;
-			if (inlen == 0) {
-				in = crypto_cursor_segbase(&cc_in);
-				inlen = crypto_cursor_seglen(&cc_in);
-			} else
+			if (inlen == 0)
+				in = crypto_cursor_segment(&cc_in, &inlen);
+			else
 				in += todo;
 
 			crypto_cursor_advance(&cc_out, todo);
 			outlen -= todo;
-			if (outlen == 0) {
-				out = crypto_cursor_segbase(&cc_out);
-				outlen = crypto_cursor_seglen(&cc_out);
-			} else
+			if (outlen == 0)
+				out = crypto_cursor_segment(&cc_out, &outlen);
+			else
 				out += todo;
 
 			resid -= todo;
@@ -394,10 +397,9 @@ isal_process(device_t dev, struct cryptop *crp, int hint)
 		}
 	} else {
 		while (resid > 0) {
-			todo = crypto_cursor_seglen(&cc_in);
+			in = crypto_cursor_segment(&cc_in, &todo);
 			if (todo > resid)
 				todo = resid;
-			in = crypto_cursor_segbase(&cc_in);
 			aes_gcm_update(&s->key_data, &context_data, in, in,
 			    todo);
 			crypto_cursor_advance(&cc_in, todo);
