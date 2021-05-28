@@ -1,4 +1,4 @@
-.\" Copyright (c) 2020 Netflix, Inc
+.\" Copyright (c) 2020-2021 Netflix, Inc
 .\"
 .\" Redistribution and use in source and binary forms, with or without
 .\" modification, are permitted provided that the following conditions
@@ -24,7 +24,7 @@
 .\" ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
 .\" THE POSSIBILITY OF SUCH DAMAGES.
 .\"
-.Dd June 29, 2020
+.Dd May 28, 2021
 .Dt ISAL 4
 .Os
 .Sh NAME
@@ -34,7 +34,7 @@
 To load the driver as a module at boot time, place the following line in
 .Xr loader.conf 5 :
 .Bd -literal -offset indent
-aesni_load="YES"
+isal_load="YES"
 .Ed
 .Sh DESCRIPTION
 This driver provides an interface between the Intel Intelligent Storage
