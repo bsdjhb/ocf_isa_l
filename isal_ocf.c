@@ -43,7 +43,8 @@
 
 #include <aes_gcm.h>
 
-#if __FreeBSD_version < 1400017
+#if __FreeBSD_version < 1300518 || \
+    (__FreeBSD_version >= 1400000 && __FreeBSD_version < 1400017)
 static __inline void *
 crypto_cursor_segment(struct crypto_buffer_cursor *cc, size_t *len)
 {
