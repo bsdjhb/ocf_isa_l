@@ -461,8 +461,12 @@ static driver_t isal_driver = {
 	sizeof(struct isal_softc)
 };
 
+#if __FreeBSD_version >= 1400058
+DRIVER_MODULE(isal, nexus, isal_driver, NULL, NULL);
+#else
 static devclass_t isal_devclass;
 
 DRIVER_MODULE(isal, nexus, isal_driver, isal_devclass, NULL, NULL);
+#endif
 MODULE_VERSION(isal, 1);
 MODULE_DEPEND(isal, crypto, 1, 1, 1);
